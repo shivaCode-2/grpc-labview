@@ -91,7 +91,7 @@ jobs:
           echo "Version: ${{ needs.version.outputs.MAJOR }}.${{ needs.version.outputs.MINOR }}.${{ needs.version.outputs.PATCH }}.${{ needs.version.outputs.BUILD }}"
           
           docker run --rm -v "${{ github.workspace }}:/workspace" ghcr.io/shivacode-2/labview:2026q1-linux-beta \
-            bash -c "cd /workspace && cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} && cmake --build build -j 16"
+            bash -c "apt-get update && apt-get install -y cmake build-essential && cd /workspace && cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} && cmake --build build -j 16"
           
           echo "Linux build succeeded"
 
