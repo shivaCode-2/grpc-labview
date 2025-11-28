@@ -1,0 +1,260 @@
+name: CI Pipeline (Docker)
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - closed
+      - reopened
+      - synchronize
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    name: Compute Version
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.compute.outputs.VERSION }}
+      MAJOR: ${{ steps.compute.outputs.MAJOR }}
+      MINOR: ${{ steps.compute.outputs.MINOR }}
+      PATCH: ${{ steps.compute.outputs.PATCH }}
+      BUILD: ${{ steps.compute.outputs.BUILD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: compute
+        shell: bash
+        run: |
+          git fetch --unshallow 2>/dev/null || echo "Already a full clone."
+          BUILD_NUMBER=$(git rev-list --count HEAD)
+          echo "Build number: $BUILD_NUMBER"
+          
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing tags found; defaulting to 0.1.0"
+            MAJOR=0
+            MINOR=1
+            PATCH=0
+          else
+            VERSION_CLEAN=$(echo "$LATEST_TAG" | sed 's/^v//' | sed 's/-build.*//')
+            MAJOR=$(echo "$VERSION_CLEAN" | cut -d. -f1)
+            MINOR=$(echo "$VERSION_CLEAN" | cut -d. -f2)
+            PATCH=$(echo "$VERSION_CLEAN" | cut -d. -f3)
+          fi
+          
+          echo "VERSION=v${MAJOR}.${MINOR}.${PATCH}-build${BUILD_NUMBER}" >> $GITHUB_OUTPUT
+          echo "MAJOR=$MAJOR" >> $GITHUB_OUTPUT
+          echo "MINOR=$MINOR" >> $GITHUB_OUTPUT
+          echo "PATCH=$PATCH" >> $GITHUB_OUTPUT
+          echo "BUILD=$BUILD_NUMBER" >> $GITHUB_OUTPUT
+          
+          echo "Computed version: v${MAJOR}.${MINOR}.${PATCH}-build${BUILD_NUMBER}"
+
+  build-linux:
+    name: Build Linux Libraries
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      BUILD_TYPE: Release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update Submodules
+        run: git submodule update --init --recursive
+
+      - name: Pull LabVIEW Docker image
+        run: docker pull ghcr.io/shivacode-2/labview:2026q1-linux-beta
+
+      - name: Create Build Environment
+        run: cmake -E make_directory ${{ github.workspace }}/build
+
+      - name: Build with Docker
+        run: |
+          echo "Building Linux Libraries"
+          echo "Version: ${{ needs.version.outputs.MAJOR }}.${{ needs.version.outputs.MINOR }}.${{ needs.version.outputs.PATCH }}.${{ needs.version.outputs.BUILD }}"
+          
+          docker run --rm -v "${{ github.workspace }}:/workspace" ghcr.io/shivacode-2/labview:2026q1-linux-beta \
+            bash -c "cd /workspace && cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} && cmake --build build -j 16"
+          
+          echo "Linux build succeeded"
+
+      - name: Print CMakeTests logs
+        if: always()
+        run: |
+          folder="${{ github.workspace }}/tests/CMakeTests/logs/"
+          
+          if [ ! -d "$folder" ]; then
+            echo "CMakeTests log folder does not exist."
+            exit 0
+          fi
+          
+          cd "$folder" || exit
+          
+          for file in *; do
+              if [ -f "$file" ]; then
+                  cat "$file"
+                  echo
+              fi
+          done
+
+      - name: Tar Build Artifacts
+        run: |
+          tar -czvf liblabview-grpc-server-linux.tar.gz -C ${{ github.workspace }}/build \
+            liblabview_grpc_server.so \
+            liblabview_grpc_generator.so
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: liblabview-grpc-server-linux
+          path: liblabview-grpc-server-linux.tar.gz
+          retention-days: 5
+
+  build-windows-x64:
+    name: Build Windows x64 Libraries
+    needs: version
+    runs-on: windows-2022
+    env:
+      BUILD_TYPE: Release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/setup-nasm@v1.5.1
+
+      - name: Update Submodules
+        run: git submodule update --init --recursive
+
+      - name: Create Build Environment
+        run: mkdir ${{ github.workspace }}\build
+
+      - name: Configure CMake
+        working-directory: ${{ github.workspace }}\build
+        run: cmake -G "Visual Studio 17 2022" -A x64 ..
+
+      - name: Build
+        working-directory: ${{ github.workspace }}\build
+        run: |
+          echo "Building Windows x64 Libraries"
+          echo "Version: ${{ needs.version.outputs.MAJOR }}.${{ needs.version.outputs.MINOR }}.${{ needs.version.outputs.PATCH }}.${{ needs.version.outputs.BUILD }}"
+          cmake --build . --config ${{ env.BUILD_TYPE }} -j 16
+
+      - name: Print CMakeTests logs
+        if: always()
+        run: |
+          $directory = "${{ github.workspace }}/tests/CMakeTests/logs"
+          
+          if (Test-Path $directory -PathType Container) {
+              Get-ChildItem -Path $directory -File -Recurse | Group-Object Directory | ForEach-Object {
+                  $subfolderName = $_.Name
+                  Write-Host "Folder: $subfolderName"
+                  $_.Group | ForEach-Object {
+                      $file = $_
+                      Get-Content $file.FullName
+                      Write-Host ""
+                  }
+                  Write-Host ""
+              }
+          } else {
+              Write-Host "CMakeTests log folder does not exist."
+          }
+
+      - name: Tar Build Artifacts
+        run: |
+          tar -czvf labview-grpc-server-windows-x64.tar.gz -C ${{ github.workspace }}\build\Release `
+            labview_grpc_server.dll `
+            labview_grpc_generator.dll
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: labview-grpc-server-windows-x64
+          path: labview-grpc-server-windows-x64.tar.gz
+          retention-days: 5
+
+  build-windows-x86:
+    name: Build Windows x86 Libraries
+    needs: version
+    runs-on: windows-2022
+    env:
+      BUILD_TYPE: Release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - uses: ilammy/setup-nasm@v1.5.1
+
+      - name: Update Submodules
+        run: git submodule update --init --recursive
+
+      - name: Create Build Environment
+        run: mkdir ${{ github.workspace }}\build
+
+      - name: Configure CMake
+        working-directory: ${{ github.workspace }}\build
+        run: cmake -G "Visual Studio 17 2022" -A Win32 ..
+
+      - name: Build
+        working-directory: ${{ github.workspace }}\build
+        run: |
+          echo "Building Windows x86 Libraries"
+          echo "Version: ${{ needs.version.outputs.MAJOR }}.${{ needs.version.outputs.MINOR }}.${{ needs.version.outputs.PATCH }}.${{ needs.version.outputs.BUILD }}"
+          cmake --build . --config ${{ env.BUILD_TYPE }} -j 16
+
+      - name: Print CMakeTests logs
+        if: always()
+        run: |
+          $directory = "${{ github.workspace }}/tests/CMakeTests/logs"
+          
+          if (Test-Path $directory -PathType Container) {
+              Get-ChildItem -Path $directory -File -Recurse | Group-Object Directory | ForEach-Object {
+                  $subfolderName = $_.Name
+                  Write-Host "Folder: $subfolderName"
+                  $_.Group | ForEach-Object {
+                      $file = $_
+                      Get-Content $file.FullName
+                      Write-Host ""
+                  }
+                  Write-Host ""
+              }
+          } else {
+              Write-Host "CMakeTests log folder does not exist."
+          }
+
+      - name: Tar Build Artifacts
+        run: |
+          tar -czvf labview-grpc-server-windows-x86.tar.gz -C ${{ github.workspace }}\build\Release `
+            labview_grpc_server.dll `
+            labview_grpc_generator.dll
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: labview-grpc-server-windows-x86
+          path: labview-grpc-server-windows-x86.tar.gz
+          retention-days: 5
